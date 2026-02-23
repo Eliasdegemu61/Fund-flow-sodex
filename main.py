@@ -1,48 +1,28 @@
-import requests
+import asyncio
+import aiohttp
 import csv
+import json
 from collections import defaultdict
 from datetime import datetime
-import time
 
-def run_sodex_processor():
-    REGISTRY_URL = "https://raw.githubusercontent.com/Eliasdegemu61/Sodex-Tracker-new-v1/refs/heads/main/registry.json"
-    API_URL = "https://alpha-biz.sodex.dev/biz/mirror/account_flow"
-    
-    print("Fetching user registry...")
-    try:
-        reg_res = requests.get(REGISTRY_URL)
-        reg_res.raise_for_status()
-        registry_data = reg_res.json()
-    except Exception as e:
-        print(f"Error loading registry: {e}")
-        return
+# Configuration
+REGISTRY_URL = "https://raw.githubusercontent.com/Eliasdegemu61/Sodex-Tracker-new-v1/refs/heads/main/registry.json"
+API_URL = "https://alpha-biz.sodex.dev/biz/mirror/account_flow"
+MAX_CONCURRENT_REQUESTS = 10  # Process 10 addresses at a time to avoid being banned
 
-    user_totals = defaultdict(lambda: defaultdict(lambda: {'dep': 0.0, 'with': 0.0}))
-    daily_totals = defaultdict(lambda: defaultdict(lambda: {'dep': 0.0, 'with': 0.0}))
-    overall_totals = defaultdict(lambda: {'dep': 0.0, 'with': 0.0})
-
+async def fetch_flow(session, addr, user_totals, daily_totals, overall_totals):
     headers = {
         "Content-Type": "application/json;charset=UTF-8",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0",
         "Origin": "https://sodex.com",
         "Referer": "https://sodex.com/"
     }
-
-    for user_entry in registry_data:
-        # Correctly extract the address from the dictionary
-        addr = user_entry.get('address')
-        if not addr:
-            continue
-            
-        print(f"Syncing: {addr}")
-        payload = {"account": addr, "start": 0, "limit": 100}
-        
-        try:
-            res = requests.post(API_URL, json=payload, headers=headers)
-            
-            # Check if response is valid JSON
-            if res.status_code == 200:
-                data = res.json()
+    payload = {"account": addr, "start": 0, "limit": 100}
+    
+    try:
+        async with session.post(API_URL, json=payload, headers=headers) as response:
+            if response.status == 200:
+                data = await response.json()
                 if data.get("code") == "0":
                     flows = data.get("data", {}).get("accountFlows", [])
                     for item in flows:
@@ -60,18 +40,39 @@ def run_sodex_processor():
                             user_totals[addr][token]['with'] += amount
                             daily_totals[date_str][token]['with'] += amount
                             overall_totals[token]['with'] += amount
-                else:
-                    print(f"API Error for {addr}: {data.get('message')}")
-            else:
-                print(f"Server Error for {addr}: Status {res.status_code}")
-                
-            # Small delay to prevent Cloudflare from blocking GitHub Actions
-            time.sleep(0.5)
+                return True
+    except Exception as e:
+        print(f"Error fetching {addr}: {e}")
+    return False
 
-        except Exception as e:
-            print(f"Failed processing {addr}: {e}")
+async def main():
+    print("Fetching registry...")
+    async with aiohttp.ClientSession() as session:
+        async with session.get(REGISTRY_URL) as resp:
+            registry_data = await resp.json()
 
-    # --- SAVE CSV FILES ---
+        user_totals = defaultdict(lambda: defaultdict(lambda: {'dep': 0.0, 'with': 0.0}))
+        daily_totals = defaultdict(lambda: defaultdict(lambda: {'dep': 0.0, 'with': 0.0}))
+        overall_totals = defaultdict(lambda: {'dep': 0.0, 'with': 0.0})
+
+        # Semaphores limit the number of parallel requests to avoid 429 errors
+        sem = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
+
+        async def sem_fetch(addr):
+            async with sem:
+                return await fetch_flow(session, addr, user_totals, daily_totals, overall_totals)
+
+        tasks = [sem_fetch(entry.get('address')) for entry in registry_data if entry.get('address')]
+        
+        print(f"Starting async sync for {len(tasks)} addresses...")
+        await asyncio.gather(*tasks)
+
+        # --- SAVE FILES ---
+        # (The CSV saving logic remains the same as before)
+        save_csvs(user_totals, daily_totals, overall_totals)
+        print("Done!")
+
+def save_csvs(user_totals, daily_totals, overall_totals):
     # File 1
     with open('user_token_totals.csv', 'w', newline='') as f:
         writer = csv.writer(f)
@@ -95,7 +96,5 @@ def run_sodex_processor():
         for token, vals in overall_totals.items():
             writer.writerow([token, f"{vals['dep']:.4f}", f"{vals['with']:.4f}"])
 
-    print("Success: Files updated.")
-
 if __name__ == "__main__":
-    run_sodex_processor()
+    asyncio.run(main())
