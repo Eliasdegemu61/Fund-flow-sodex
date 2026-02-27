@@ -18,43 +18,63 @@ async def fetch_flow(session, addr, user_totals, daily_totals, overall_totals):
         "Referer": "https://sodex.com/"
     }
     
-    # FIX: Increased limit to 1000 to capture all historical tokens
-    payload = {"account": addr, "start": 0, "limit": 1000}
+    start = 0
+    limit = 100 # The API caps at 100 per request
     
     try:
-        async with session.post(API_URL, json=payload, headers=headers) as response:
-            if response.status == 200:
-                data = await response.json()
-                if data.get("code") == "0":
-                    flows = data.get("data", {}).get("accountFlows", [])
+        while True:
+            payload = {"account": addr, "start": start, "limit": limit}
+            async with session.post(API_URL, json=payload, headers=headers) as response:
+                if response.status != 200:
+                    break
+                
+                res_json = await response.json()
+                data_section = res_json.get("data")
+                
+                # If 'data' is null or missing, we've hit the end
+                if not data_section:
+                    break
+                
+                flows = data_section.get("accountFlows", [])
+                if not flows:
+                    break
+                
+                for item in flows:
+                    token = item.get("coin", "UNKNOWN").upper()
+                    # Default to 18 if decimals missing, but USDC will use 6
+                    decimals = int(item.get("decimals", 18))
                     
-                    for item in flows:
-                        token = item.get("coin", "UNKNOWN").upper()
-                        decimals = int(item.get("decimals", 18))
+                    try:
+                        # Convert raw amount to human readable
+                        amount = int(item.get("amount", 0)) / (10 ** decimals)
+                    except:
+                        continue
                         
-                        try:
-                            # Convert raw amount to human readable
-                            amount = int(item.get("amount", 0)) / (10 ** decimals)
-                        except:
-                            continue
-                            
-                        tx_type = item.get("type", "")
-                        # Convert timestamp to YYYY-MM-DD
-                        date_str = datetime.fromtimestamp(item.get("stmp", 0)).strftime('%Y-%m-%d')
+                    tx_type = item.get("type", "")
+                    # Convert timestamp to YYYY-MM-DD
+                    date_str = datetime.fromtimestamp(item.get("stmp", 0)).strftime('%Y-%m-%d')
 
-                        # Logic: Check if the transaction type contains 'Deposit' or 'Withdraw'
-                        if "Deposit" in tx_type:
-                            user_totals[addr][token]['dep'] += amount
-                            daily_totals[date_str][token]['dep'] += amount
-                            overall_totals[token]['dep'] += amount
-                        elif "Withdraw" in tx_type:
-                            user_totals[addr][token]['with'] += amount
-                            daily_totals[date_str][token]['with'] += amount
-                            overall_totals[token]['with'] += amount
-                return True
+                    # Logic: Aggregate totals based on transaction type
+                    if "Deposit" in tx_type:
+                        user_totals[addr][token]['dep'] += amount
+                        daily_totals[date_str][token]['dep'] += amount
+                        overall_totals[token]['dep'] += amount
+                    elif "Withdraw" in tx_type:
+                        user_totals[addr][token]['with'] += amount
+                        daily_totals[date_str][token]['with'] += amount
+                        overall_totals[token]['with'] += amount
+                
+                # If we retrieved fewer than the limit, there are no more pages
+                if len(flows) < limit:
+                    break
+                
+                # Increment offset to fetch the next 100 transactions
+                start += limit
+                
+        return True
     except Exception as e:
         print(f"Error fetching {addr}: {e}")
-    return False
+        return False
 
 def save_csvs(user_totals, daily_totals, overall_totals):
     # File 1: User Summary (One row per address-token pair)
@@ -64,7 +84,6 @@ def save_csvs(user_totals, daily_totals, overall_totals):
         for addr in sorted(user_totals.keys()):
             for token in sorted(user_totals[addr].keys()):
                 vals = user_totals[addr][token]
-                # Only save if there is actual activity
                 if vals['dep'] > 0 or vals['with'] > 0:
                     writer.writerow([addr, token, f"{vals['dep']:.6f}", f"{vals['with']:.6f}"])
 
@@ -86,13 +105,13 @@ def save_csvs(user_totals, daily_totals, overall_totals):
             writer.writerow([token, f"{vals['dep']:.6f}", f"{vals['with']:.6f}"])
 
 async def main():
-    print("Starting processing...")
+    print("Starting processing with Pagination...")
     async with aiohttp.ClientSession() as session:
         # Fetching registry from your GitHub
         async with session.get(REGISTRY_URL) as resp:
             registry_data = await resp.json(content_type=None)
 
-        # Storage for all tokens across all users
+        # Storage structures
         user_totals = defaultdict(lambda: defaultdict(lambda: {'dep': 0.0, 'with': 0.0}))
         daily_totals = defaultdict(lambda: defaultdict(lambda: {'dep': 0.0, 'with': 0.0}))
         overall_totals = defaultdict(lambda: {'dep': 0.0, 'with': 0.0})
@@ -103,9 +122,9 @@ async def main():
             async with sem:
                 return await fetch_flow(session, addr, user_totals, daily_totals, overall_totals)
 
-        # Start the batch request
+        # Start the batch request for all addresses in registry
         tasks = [sem_fetch(entry.get('address')) for entry in registry_data if entry.get('address')]
-        print(f"Syncing {len(tasks)} addresses (Limit: 1000 tx per user)...")
+        print(f"Syncing {len(tasks)} addresses (Full History via Pagination)...")
         await asyncio.gather(*tasks)
 
         print("Generating CSV files...")
